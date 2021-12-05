@@ -24,7 +24,7 @@ func initWork(isDir bool, tail ...string) string {
 		if err != nil {
 			tmp = os.TempDir()
 		}
-		rootWorkDir = filepath.Join(tmp, "cgowrap")
+		rootWorkDir = filepath.Join(tmp, "cgowrap", "v1")
 	}
 
 	dir := rootWorkDir

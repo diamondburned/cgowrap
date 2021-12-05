@@ -8,21 +8,74 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/diamondburned/cgowrap/internal/depfile"
+	"github.com/diamondburned/cgowrap/internal/logg"
+	"github.com/peterbourgon/diskv/v3"
 	"go.etcd.io/bbolt"
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound        = errors.New("not found")
+	ErrMismatchModTime = errors.New("modTime mismatch")
+)
 
 var (
 	depfileBucket    = "depfile"
 	guessKindsBucket = "guessKinds"
 )
 
+func joinKeys(parts ...string) string {
+	return strings.Join(parts, "$")
+}
+
+func getKV(db *diskv.Diskv, keys []string) (io.ReadCloser, error) {
+	return db.ReadStream(joinKeys(keys...), true)
+}
+
+func getKVJSON(db *diskv.Diskv, keys []string, v interface{}) error {
+	r, err := db.ReadStream(joinKeys(keys...), true)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return json.NewDecoder(r).Decode(v)
+}
+
+func getKVBytes(db *diskv.Diskv, keys []string) ([]byte, error) {
+	return db.Read(joinKeys(keys...))
+}
+
+func getKVCompressed(db *diskv.Diskv, keys []string) ([]byte, error) {
+	r, err := db.ReadStream(joinKeys(keys...), true)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	z, err := zlib.NewReader(r)
+	if err != nil {
+		logg.DebugFatalErr("zlib: NewReader:", err)
+		return nil, err
+	}
+
+	b, err := io.ReadAll(z)
+	if err != nil {
+		logg.DebugFatalErr("zlib: read:", err)
+		return nil, err
+	}
+
+	return b, nil
+}
+
+func setKV(db *diskv.Diskv, keys []string, v []byte) error {
+	return db.Write(joinKeys(keys...), v)
+}
+
 type Cache struct {
-	db         *bbolt.DB
+	db         *diskv.Diskv
 	Depfile    *DepfileCache
 	GuessKinds *GuessKindsCache
 }
@@ -32,20 +85,18 @@ func OpenCache() (*Cache, error) {
 	opt.Timeout = time.Minute
 	opt.FreelistType = bbolt.FreelistMapType
 
-	b, err := bbolt.Open(WorkFile("cache"), os.ModePerm, &opt)
-	if err != nil {
-		return nil, err
-	}
+	kv := diskv.New(diskv.Options{
+		BasePath:     WorkDir("cache"),
+		TempDir:      WorkDir(".cache.tmp"),
+		Transform:    func(s string) []string { return nil },
+		CacheSizeMax: 0,
+	})
 
-	c := &Cache{db: b}
+	c := &Cache{db: kv}
 	c.Depfile = (*DepfileCache)(c)
 	c.GuessKinds = (*GuessKindsCache)(c)
 
 	return c, nil
-}
-
-func (c *Cache) Close() error {
-	return c.db.Close()
 }
 
 type DepfileCache Cache
@@ -56,33 +107,20 @@ type depfileValue struct {
 }
 
 // IsValid returns true if the depfile cache is still valid.
-func (c *DepfileCache) IsValid(id string) bool {
+func (c *DepfileCache) Validate(id string) error {
 	var value depfileValue
 
-	err := c.db.View(func(tx *bbolt.Tx) error {
-		b, err := bucketTx(tx, depfileBucket)
-		if err != nil {
-			return ErrNotFound
-		}
-
-		v := b.Get([]byte(id))
-		if v == nil {
-			return ErrNotFound
-		}
-
-		return json.Unmarshal(v, &value)
-	})
-
-	if err != nil {
-		return false
+	if err := getKVJSON(c.db, []string{depfileBucket, id}, &value); err != nil {
+		return err
 	}
 
 	t := value.File.ModTime()
-	log.Println(" got modTime =", t)
-	log.Println("prev modTime =", value.Latest)
-
 	// Verify the file list's modification time.
-	return !t.IsZero() && t.Equal(value.Latest)
+	if t.IsZero() || !t.Equal(value.Latest) {
+		return ErrMismatchModTime
+	}
+
+	return nil
 }
 
 func (c *DepfileCache) Path(id string) string {
@@ -106,14 +144,7 @@ func (c *DepfileCache) Save(id string) error {
 		return err
 	}
 
-	return c.db.Update(func(tx *bbolt.Tx) error {
-		b, err := bucketTx(tx, depfileBucket)
-		if err != nil {
-			return err
-		}
-
-		return b.Put([]byte(id), v)
-	})
+	return setKV(c.db, []string{depfileBucket, id}, v)
 }
 
 type GuessKindsCache Cache
@@ -136,22 +167,17 @@ func (o Output) Print() {
 
 func (c *GuessKindsCache) Load(k string) (Output, bool) {
 	var out Output
+	keys := []string{guessKindsBucket, k, "json"}
 
-	c.db.View(func(tx *bbolt.Tx) error {
-		b, _ := bucketTx(tx, guessKindsBucket, k)
-		if b == nil {
-			return ErrNotFound
-		}
+	if err := getKVJSON(c.db, keys, &out); err != nil {
+		return out, false
+	}
 
-		if err := json.Unmarshal(b.Get([]byte("json")), &out); err != nil {
-			return err
-		}
+	keys[2] = "out"
+	out.Stdout, _ = getKVCompressed(c.db, keys)
 
-		out.Stdout, _ = decompressBytes(b.Get([]byte("out")))
-		out.Stderr, _ = decompressBytes(b.Get([]byte("err")))
-
-		return nil
-	})
+	keys[2] = "err"
+	out.Stderr, _ = getKVCompressed(c.db, keys)
 
 	return out, !out.IsEmpty()
 }
@@ -162,25 +188,18 @@ func (c *GuessKindsCache) Save(k string, out Output) error {
 		return err
 	}
 
-	return c.db.Update(func(tx *bbolt.Tx) error {
-		b, err := bucketTx(tx, guessKindsBucket, k)
+	errs := []error{
+		setKV(c.db, []string{guessKindsBucket, k, "json"}, j),
+		setKV(c.db, []string{guessKindsBucket, k, "out"}, compressBytes(out.Stdout)),
+		setKV(c.db, []string{guessKindsBucket, k, "err"}, compressBytes(out.Stderr)),
+	}
+
+	for _, err := range errs {
 		if err != nil {
 			return err
 		}
-
-		errs := []error{
-			b.Put([]byte("json"), j),
-			b.Put([]byte("out"), compressBytes(out.Stdout)),
-			b.Put([]byte("err"), compressBytes(out.Stderr)),
-		}
-
-		for _, err := range errs {
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func compressBytes(b []byte) []byte {
@@ -197,20 +216,6 @@ func compressBytes(b []byte) []byte {
 	}
 
 	return out.Bytes()
-}
-
-func decompressBytes(b []byte) ([]byte, error) {
-	r, err := zlib.NewReader(bytes.NewReader(b))
-	if err != nil {
-		log.Println("zlib: NewReader:", err)
-		return nil, err
-	}
-	b, err = io.ReadAll(r)
-	if err != nil {
-		log.Println("zlib: read:", err)
-		return nil, err
-	}
-	return b, nil
 }
 
 func cpyBytes(b []byte) []byte {

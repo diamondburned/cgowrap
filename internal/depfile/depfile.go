@@ -57,7 +57,12 @@ func ParseFileOnDisk(path string) (*File, error) {
 	}
 	defer f.Close()
 
-	return ParseFile(f)
+	p, err := ParseFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse depfile %q: %w", path, err)
+	}
+
+	return p, nil
 }
 
 // ParseFile parses the given reader.

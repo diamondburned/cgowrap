@@ -9,14 +9,15 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/diamondburned/cgowrap/internal/cgowrap"
+	"github.com/diamondburned/cgowrap/internal/csvfile"
 	"github.com/diamondburned/cgowrap/internal/logg"
+	"github.com/diamondburned/cgowrap/internal/shortflag"
 )
-
-func init() {
-	logg.SetEnabled(os.Getenv("CGOWRAP_FATAL") == "1")
-}
 
 type state struct {
 	args      []string
@@ -32,7 +33,17 @@ type cacheState struct {
 	cacheKey    string
 }
 
+var pwd, _ = os.Getwd()
+
+var (
+	profileOut = os.Getenv("CGOWRAP_PROFILE")
+	runFatal   = os.Getenv("CGOWRAP_FATAL") == "1"
+	mustCache  = os.Getenv("CGOWRAP_MUST_CACHE") == "1"
+)
+
 func main() {
+	logg.SetEnabled(runFatal || mustCache)
+
 	out := run()
 	out.Print()
 	os.Exit(out.Status)
@@ -43,22 +54,51 @@ func run() cgowrap.Output {
 	s.init()
 	defer s.close()
 
-	if out, ok := s.cached(); ok {
-		return out
+	var out cgowrap.Output
+
+	f := func() bool {
+		o, ok := s.cached()
+		if ok {
+			out = o
+			return false
+		}
+
+		out = s.run()
+		return true
 	}
 
-	return s.run()
+	if profileOut != "" {
+		s.record(f)
+	} else {
+		f()
+	}
+
+	return out
+}
+
+func (s *state) record(f func() bool) {
+	start := time.Now()
+	status := "cached"
+	if f() {
+		status = "uncached"
+	}
+	end := time.Now()
+
+	csvfile.Write(profileOut,
+		strings.Join(s.args, " "),
+		strconv.FormatFloat(end.Sub(start).Seconds(), 'f', -1, 64),
+		status,
+	)
 }
 
 func (s *state) init() {
-	if s.args[len(s.args)-1] == "-" {
-		// TODO: stdin support
-		return
-	}
+	// isGuessKinds relies on the assumption that when the check passes, only
+	// one input will ever be given, which is cgo's crafted input file. This
+	// assumption simplifies the code a lot.
 
 	input, err := os.ReadFile(s.args[len(s.args)-1])
 	if err != nil {
-		logg.DebugFatal("cannot open input file:", err)
+		// Probably an incorrect assumption about arguments.
 		return
 	}
 
@@ -81,17 +121,27 @@ func (s *state) cached() (cgowrap.Output, bool) {
 		return cgowrap.Output{}, false
 	}
 
-	s.cache.depfileKey = fmt.Sprintf("cgo.%s.d", hashInputs(
-		// Use the arguments (excluded input path) and the input file content as
-		// the hash for the depfile name.
-		s.args[:len(s.args)-1],
-		s.input,
-	))
+	// Parse never returns nil.
+	args, err := shortflag.Parse(s.args, shortflag.Opts{
+		ValueFlags: []string{"-o"},
+	})
+	if err != nil {
+		logg.DebugFatalErr("error parsing flags:", err)
+		return cgowrap.Output{}, false
+	}
 
-	if !s.cache.Depfile.IsValid(s.cache.depfileKey) {
+	// Ues the arguments without the -o flag and all input files. The input file
+	// is assumed to only be 1, and the -o flag is not deterministic.
+	neededArgs := shortflag.OmitNonFlags(args.Args)
+	// Use neededArgs as the hash input for depfileKey along with the input
+	// file's content and the current working directory.
+	hash := hashAll([]interface{}{neededArgs, pwd, s.input})
+	s.cache.depfileKey = fmt.Sprintf("cgo.%s.d", hash)
+
+	if err := s.cache.Depfile.Validate(s.cache.depfileKey); err != nil {
 		// Depfile not found, so avoid this cache and ask for a new one.
 		s.args = append([]string{"-MD", "-MF", s.cache.Depfile.Path(s.cache.depfileKey)}, s.args...)
-		log.Println("invalid depfile")
+		cacheMissed(neededArgs, hash, "invalid depfile:", err)
 		return cgowrap.Output{}, false
 	}
 
@@ -99,12 +149,19 @@ func (s *state) cached() (cgowrap.Output, bool) {
 	// need to account for this in the input hash, though.
 	out, ok := s.cache.GuessKinds.Load(s.cache.depfileKey)
 	if ok {
-		log.Println("cache hit")
 		return out, true
 	}
-
-	log.Println("missing guesskinds")
+	cacheMissed(neededArgs, hash, "missing guessKinds")
 	return cgowrap.Output{}, false
+}
+
+func cacheMissed(args []string, hash string, v ...interface{}) {
+	if mustCache {
+		log.Printf("args: %q", args)
+		log.Printf("hash: %q", hash)
+		v = append([]interface{}{"cache missed:"}, v...)
+		log.Fatalln(v...)
+	}
 }
 
 // openCache initializes the cache.
@@ -124,10 +181,6 @@ func (s *state) openCache() bool {
 }
 
 func (s *state) close() {
-	if s.cacheable {
-		err := s.cache.Close()
-		logg.DebugFatalErr("cannot close db:", err)
-	}
 }
 
 // run runs the compiler and caches it if available.
@@ -180,7 +233,7 @@ func hashStr(str string) string {
 	return base64.URLEncoding.EncodeToString(h.Sum([]byte(str)))
 }
 
-func hashInputs(v ...interface{}) string {
+func hashAll(v ...interface{}) string {
 	h := sha256.New()
 	for _, v := range v {
 		switch v := v.(type) {
